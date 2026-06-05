@@ -1,0 +1,86 @@
+#version: "2"
+services:
+  rabbitmq:
+    container_name: prs-rabbitmq
+    image: rabbitmq:management
+    ports:
+        - "5672:5672" # Exposing RabbitMQ on different port for convenience
+        - "15672:15672" # Exposing RabbitMQ web management on different port for convenience
+    restart: always
+    healthcheck:                     # Bug 4 fixed: required for condition: service_healthy
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    container_name: prs-mysql
+    image: mysql:8.0
+    ports:
+        - "3306:3306" # Exposing MySQL on different port for convenience
+    environment:
+        MYSQL_ROOT_PASSWORD: "rootpassword"
+        MYSQL_DATABASE: "prs_db" 
+        MYSQL_USER: "prs_user"
+        MYSQL_PASSWORD: "prs_password"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./prs_service/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: always
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  service:
+    build:
+      context: ./prs_service/
+      dockerfile: Dockerfile
+    container_name: prs_service
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      RABBIT_PASSWORD: guest
+      RABBIT_USER: guest
+      RABBIT_HOST: rabbitmq
+      RABBIT_PORT: 5672
+      RABBIT_MANAGEMENT_PORT: 15672
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: prs_db
+      DB_USER: prs_user
+      DB_PASSWORD: prs_password
+    volumes:
+      - ./prs_service:/app
+    command: nameko run --config config.yml service
+
+  gateway:
+    build:
+      context: ./prs_service/
+      dockerfile: Dockerfile.gateway
+    container_name: prs_gateway
+    ports:
+      - "5000:5000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBIT_PASSWORD: guest
+      RABBIT_USER: guest
+      RABBIT_HOST: rabbitmq
+      RABBIT_PORT: 5672
+    volumes:
+      - ./prs_service:/app
+    command: nameko run --config config.yml gateway
+
+# networks:
+#   default:
+#     name:  prs
+#     external: true
+
+volumes:
+  mysql_data:

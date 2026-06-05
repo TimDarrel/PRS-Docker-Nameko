@@ -1,0 +1,9 @@
+AMQP_URI: "amqp://guest:guest@rabbitmq:5672/"
+
+WEB_SERVER_ADDRESS: '0.0.0.0:5000'
+
+DB_HOST: "${DB_HOST:localhost}"
+DB_PORT: "${DB_PORT:3306}"
+DB_NAME: "${DB_NAME:prs_db}"
+DB_USER: "${DB_USER:prs_user}"
+DB_PASSWORD: "${DB_PASSWORD:prs_password}"

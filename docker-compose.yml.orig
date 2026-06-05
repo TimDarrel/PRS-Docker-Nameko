@@ -1,0 +1,80 @@
+version: "3.8"
+ 
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: prs_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+ 
+  mysql:
+    image: mysql:8.0
+    container_name: prs_mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: prs_db
+      MYSQL_USER: prs_user
+      MYSQL_PASSWORD: prs_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+ 
+  service:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+    container_name: prs_service
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      RABBIT_PASSWORD: guest
+      RABBIT_USER: guest
+      RABBIT_HOST: rabbitmq
+      RABBIT_PORT: 5672
+      RABBIT_MANAGEMENT_PORT: 15672
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: prs_db
+      DB_USER: prs_user
+      DB_PASSWORD: prs_password
+    volumes:
+      - .:/app
+    command: nameko run --config config.yml service
+ 
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: prs_gateway
+    ports:
+      - "5000:5000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBIT_PASSWORD: guest
+      RABBIT_USER: guest
+      RABBIT_HOST: rabbitmq
+      RABBIT_PORT: 5672
+    volumes:
+      - .:/app
+    command: python gateway.py
+ 
+volumes:
+  rabbitmq_data:
+  mysql_data:
