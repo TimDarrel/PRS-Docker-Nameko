@@ -2,44 +2,32 @@
 service.py — Nameko RPC microservice for PRS (Pembuatan Rencana Studi).
 
 Tables owned:
-  prs         — header per mahasiswa per semester
-  prs_detail  — kelas yang diambil, with prioritas & status_validasi
+    prs         — header per mahasiswa per semester
+    prs_detail  — kelas yang diambil, with prioritas & status_validasi
+    jadwal_ss   — snapshot jadwal from Penawaran Kelas at enrollment time
 
 Exposed RPC methods (mapped from function matrix):
-  1. create_prs               — insert PRS header (status=draft)
-  2. create_prs_detail        — insert one kelas into a PRS
-  3. get_prs                  — fetch PRS header by id_mahasiswa + id_semester
-  4. get_prs_detail_by_semester  — all details for a given semester
-  5. get_prs_detail_by_prs_id    — all details for a given id_prs
-  6. get_prs_detail_by_kelas_id  — all details for a given id_kelas (across all PRS)
-  7. get_jumlah_mahasiswa_per_kelas — count students enrolled per kelas
-  8. verify_prs               — approve/reject detail lines + add comment, update total_sks
-  9. push_peserta_to_transkrip — mark validated PRS details as finalized (triggers transkrip)
+    1. create_prs               — insert PRS header (status=draft)
+    2. create_prs_detail        — insert one kelas into a PRS
+    3. get_prs                  — fetch PRS header by id_mahasiswa + id_semester
+    4. get_prs_detail_by_semester  — all details for a given semester
+    5. get_prs_detail_by_prs_id    — all details for a given id_prs
+    6. get_prs_detail_by_kelas_id  — all details for a given id_kelas (across all PRS)
+    7. get_jumlah_mahasiswa_per_kelas — count students enrolled per kelas
+    8. verify_prs               — approve/reject detail lines + add comment, update total_sks
+    9. push_peserta_to_transkrip — mark validated PRS details as finalized (triggers transkrip)
+    10. snapshot_jadwal          — snapshot jadwal from Penawaran Kelas into jadwal_ss
+    11. sync_jadwal_snapshot      — update jadwal_ss when Penawaran Kelas notifies of jadwal change
+    12. debug_dump               — dump all PRS + details + jadwal_ss
 """
 
 import os
 import logging
 
 import pymysql
-from nameko.rpc import rpc
+from nameko.rpc import rpc, RpcProxy
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# DB helper
-# ---------------------------------------------------------------------------
-
-def get_connection(config):
-    return pymysql.connect(
-        host=config.get("DB_HOST", os.getenv("DB_HOST", "localhost")),
-        port=int(config.get("DB_PORT", os.getenv("DB_PORT", 3306))),
-        user=config.get("DB_USER", os.getenv("DB_USER", "prs_user")),
-        password=config.get("DB_PASSWORD", os.getenv("DB_PASSWORD", "prs_password")),
-        database=config.get("DB_NAME", os.getenv("DB_NAME", "prs_db")),
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=False,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +39,22 @@ class PRSService:
 
     name = "prs_service"
 
+    # NOTE: This proxy is currently UNUSED for real calls — create_prs_detail
+    # uses dummy jadwal data (see TODO there) until Penawaran Kelas exposes
+    # its jadwal-fetching RPC method. Once available, swap the dummy block
+    # in create_prs_detail for a call to self.penawaran_kelas_rpc.<method_name>.
+    penawaran_kelas_rpc = RpcProxy("penawaran_kelas_service")
+
     def _db(self):
-        return get_connection(self.config)
+        return pymysql.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", 3306)),
+            user=os.getenv("DB_USER", "prs_user"),
+            password=os.getenv("DB_PASSWORD", "prs_password"),
+            database=os.getenv("DB_NAME", "prs_db"),
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=False,
+        )
 
     # -----------------------------------------------------------------------
     # 1. Create PRS
@@ -117,6 +119,30 @@ class PRSService:
                     (id_prs, id_kelas, id_mata_kuliah, prioritas, sks),
                 )
                 id_detail = cur.lastrowid
+
+                # ------------------------------------------------------------
+                # DUMMY DATA — jadwal snapshot at enrollment time
+                # ------------------------------------------------------------
+                # TODO: This is placeholder data. Once Penawaran Kelas exposes
+                # its RPC method (e.g. get_jadwal_by_kelas), replace the line
+                # below with:
+                #
+                #     jadwal_list = self.penawaran_kelas_rpc.get_jadwal_by_kelas(id_kelas)
+                #
+                # Make sure the dicts returned have the keys expected by
+                # _snapshot_jadwal: id_jadwal, hari, jam_mulai, jam_selesai,
+                # ruangan, tipe.
+                jadwal_list = [
+                    {
+                        "id_jadwal": id_kelas * 1000 + 1,  # dummy unique id
+                        "hari": "Senin",
+                        "jam_mulai": "08:00:00",
+                        "jam_selesai": "09:40:00",
+                        "ruangan": "DUMMY-ROOM",
+                        "tipe": "teori",
+                    }
+                ]
+                self._snapshot_jadwal(db, id_detail, jadwal_list)
             db.commit()
             return {"message": "Kelas berhasil ditambahkan ke PRS", "id_detail_prs": id_detail}
         except pymysql.IntegrityError:
@@ -404,6 +430,164 @@ class PRSService:
                 "message": f"{len(peserta)} peserta siap dipush ke transkrip",
                 "id_semester": id_semester,
                 "peserta": peserta,
+            }
+        finally:
+            db.close()
+            
+
+    # -----------------------------------------------------------------------
+    # 10. Snapshot jadwal into jadwal_ss (called inside create_prs_detail)
+    # -----------------------------------------------------------------------
+
+    def _snapshot_jadwal(self, db, id_detail_prs, jadwal_list):
+        """
+        Internal helper — snapshots jadwal from Penawaran Kelas into jadwal_ss.
+        jadwal_list: list of dicts with keys:
+            id_jadwal, hari, jam_mulai, jam_selesai, ruangan, tipe
+        """
+        with db.cursor() as cur:
+            for j in jadwal_list:
+                cur.execute(
+                    """INSERT INTO jadwal_ss
+                           (id_jadwal, id_detail_prs, jam_mulai, jam_selesai,
+                            hari, ruangan, tipe, is_outdated)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 0)""",
+                    (
+                        j["id_jadwal"],
+                        id_detail_prs,
+                        j["jam_mulai"],
+                        j["jam_selesai"],
+                        j["hari"],
+                        j["ruangan"],
+                        j["tipe"],
+                    ),
+                )
+                
+    @rpc
+    def snapshot_jadwal(self, id_detail_prs, jadwal_list):
+        """
+        Public RPC wrapper around _snapshot_jadwal.
+        Called by Penawaran Kelas when a new jadwal is created.
+        """
+        db = self._db()
+        try:
+            self._snapshot_jadwal(db, id_detail_prs, jadwal_list)
+            db.commit()
+            return {"message": "Snapshot jadwal berhasil dibuat", "id_detail_prs": id_detail_prs}
+        except Exception as e:
+            db.rollback()
+            return {"error": str(e)}
+        finally:
+            db.close()
+
+    # -----------------------------------------------------------------------
+    # 11. Sync jadwal snapshot (called when Penawaran Kelas updates a jadwal)
+    # -----------------------------------------------------------------------
+
+    @rpc
+    def sync_jadwal_snapshot(self, id_detail_prs, jadwal_list):
+        """
+        Updates jadwal_ss when Penawaran Kelas notifies of a jadwal change.
+        Edits existing rows in-place using id_jadwal as the stable key.
+        Removes rows that no longer exist in the new jadwal_list.
+
+        jadwal_list: list of dicts with keys:
+            id_jadwal, hari, jam_mulai, jam_selesai, ruangan, tipe
+        """
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                incoming_ids = [j["id_jadwal"] for j in jadwal_list]
+
+                # Remove rows that are no longer in the new jadwal_list
+                if incoming_ids:
+                    placeholders = ",".join(["%s"] * len(incoming_ids))
+                    cur.execute(
+                        f"DELETE FROM jadwal_ss WHERE id_detail_prs = %s AND id_jadwal NOT IN ({placeholders})",
+                        [id_detail_prs, *incoming_ids],
+                    )
+                else:
+                    # No jadwal at all — wipe everything for this detail
+                    cur.execute(
+                        "DELETE FROM jadwal_ss WHERE id_detail_prs = %s",
+                        (id_detail_prs,),
+                    )
+
+                for j in jadwal_list:
+                    cur.execute(
+                        """UPDATE jadwal_ss
+                               SET jam_mulai   = %s,
+                                   jam_selesai = %s,
+                                   hari        = %s,
+                                   ruangan     = %s,
+                                   tipe        = %s,
+                                   is_outdated = 0
+                           WHERE id_jadwal = %s AND id_detail_prs = %s""",
+                        (
+                            j["jam_mulai"],
+                            j["jam_selesai"],
+                            j["hari"],
+                            j["ruangan"],
+                            j["tipe"],
+                            j["id_jadwal"],
+                            id_detail_prs,
+                        ),
+                    )
+                    if cur.rowcount == 0:  # Row didn't exist — insert fresh
+                        cur.execute(
+                            """INSERT INTO jadwal_ss
+                                   (id_jadwal, id_detail_prs, jam_mulai, jam_selesai,
+                                    hari, ruangan, tipe, is_outdated)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, 0)""",
+                            (
+                                j["id_jadwal"],
+                                id_detail_prs,
+                                j["jam_mulai"],
+                                j["jam_selesai"],
+                                j["hari"],
+                                j["ruangan"],
+                                j["tipe"],
+                            ),
+                        )
+
+            db.commit()
+            return {"message": "Jadwal snapshot updated", "id_detail_prs": id_detail_prs}
+        except Exception as e:
+            db.rollback()
+            return {"error": str(e)}
+        finally:
+            db.close()
+
+    # -----------------------------------------------------------------------
+    # 12. Debug — dump all PRS, PRS_Detail, and Jadwal_SS
+    # -----------------------------------------------------------------------
+
+    @rpc
+    def debug_dump(self):
+        """
+        Returns all rows from prs, prs_detail, and jadwal_ss joined together.
+        For debugging only — do not expose in production.
+        """
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                cur.execute("SELECT * FROM prs ORDER BY id_prs")
+                all_prs = cur.fetchall()
+
+                cur.execute(
+                    """SELECT pd.*, j.id_jadwal_ss, j.id_jadwal,
+                              j.hari, j.jam_mulai, j.jam_selesai,
+                              j.ruangan, j.tipe, j.is_outdated,
+                              j.snapshotted_at
+                       FROM prs_detail pd
+                       LEFT JOIN jadwal_ss j ON pd.id_detail_prs = j.id_detail_prs
+                       ORDER BY pd.id_prs, pd.id_detail_prs"""
+                )
+                all_detail = cur.fetchall()
+
+            return {
+                "prs": all_prs,
+                "prs_detail_with_jadwal": all_detail,
             }
         finally:
             db.close()
