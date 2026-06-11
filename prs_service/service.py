@@ -26,6 +26,7 @@ import logging
 
 import pymysql
 from nameko.rpc import rpc, RpcProxy
+from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -565,7 +566,7 @@ class PRSService:
     @rpc
     def debug_dump(self):
         """
-        Returns all rows from prs, prs_detail, and jadwal_ss joined together.
+        Returns all rows from prs, prs_detail, and jadwal_ss as separate tables.
         For debugging only — do not expose in production.
         """
         db = self._db()
@@ -574,20 +575,29 @@ class PRSService:
                 cur.execute("SELECT * FROM prs ORDER BY id_prs")
                 all_prs = cur.fetchall()
 
-                cur.execute(
-                    """SELECT pd.*, j.id_jadwal_ss, j.id_jadwal,
-                              j.hari, j.jam_mulai, j.jam_selesai,
-                              j.ruangan, j.tipe, j.is_outdated,
-                              j.snapshotted_at
-                       FROM prs_detail pd
-                       LEFT JOIN jadwal_ss j ON pd.id_detail_prs = j.id_detail_prs
-                       ORDER BY pd.id_prs, pd.id_detail_prs"""
-                )
+                cur.execute("SELECT * FROM prs_detail ORDER BY id_prs, id_detail_prs")
                 all_detail = cur.fetchall()
 
+                cur.execute("SELECT * FROM jadwal_ss ORDER BY id_detail_prs, id_jadwal_ss")
+                all_jadwal = cur.fetchall()
+
             return {
-                "prs": all_prs,
-                "prs_detail_with_jadwal": all_detail,
+                "prs": [self._serialize_row(r) for r in all_prs],
+                "prs_detail": [self._serialize_row(r) for r in all_detail],
+                "jadwal_ss": [self._serialize_row(r) for r in all_jadwal],
             }
         finally:
             db.close()
+
+    @staticmethod
+    def _serialize_row(row):
+        """Convert datetime/timedelta values in a row dict to JSON-safe strings."""
+        out = {}
+        for k, v in row.items():
+            if isinstance(v, (datetime, date)):
+                out[k] = v.isoformat()
+            elif isinstance(v, timedelta):
+                out[k] = str(v)  # e.g. "8:00:00"
+            else:
+                out[k] = v
+        return out
