@@ -1,18 +1,24 @@
 """
 gateway.py — HTTP gateway for the PRS microservice.
 
-Routes mapped to the 9 RPC methods:
-
-  POST   /prs                                  → create_prs
-  POST   /prs/<id_prs>/detail                  → create_prs_detail
-  GET    /prs?id_mahasiswa=&id_semester=        → get_prs
-  GET    /prs/detail?id_semester=              → get_prs_detail_by_semester
-  GET    /prs/<id_prs>/detail                  → get_prs_detail_by_prs_id
-  GET    /prs/detail/kelas/<id_kelas>          → get_prs_detail_by_kelas_id
-  GET    /prs/kelas/<id_kelas>/jumlah          → get_jumlah_mahasiswa_per_kelas
-  POST   /prs/<id_prs>/verify                  → verify_prs
-  POST   /prs/transkrip/<id_semester>          → push_peserta_to_transkrip
+Routes:
+  GET    /health
+  POST   /prs                                        → create_prs
+  POST   /prs/<id_prs>/detail                        → create_prs_detail
+  GET    /prs/<id_mahasiswa>/<id_semester>            → get_prs
+  GET    /prs/detail/<id_semester>              → get_prs_detail_by_semester
+  GET    /prs/<id_prs>/detail                        → get_prs_detail_by_prs_id
+  GET    /prs/detail/kelas/<id_kelas>                → get_prs_detail_by_kelas_id
+  GET    /prs/kelas/<id_kelas>/jumlah                → get_jumlah_mahasiswa_per_kelas
+  GET    /prs/kelas/jumlah                           → get_jumlah_mahasiswa_per_kelas (all)
+  PUT    /prs/<id_prs>/verify                        → verify_prs          (single student, auto)
+  POST   /prs/semester/<id_semester>/verify          → verify_prs_by_semester (whole semester)
+  POST   /prs/transkrip/<id_semester>                → push_peserta_to_transkrip
+  POST   /prs/detail/<id_detail_prs>/jadwal/snapshot → snapshot_jadwal
+  POST   /prs/jadwal/snapshot/<id_detail_prs>        → sync_jadwal_snapshot
+  GET    /debug/dump                                 → debug_dump
 """
+
 import json
 from datetime import datetime, date
 from nameko.rpc import RpcProxy
@@ -88,14 +94,11 @@ class GatewayService:
 
     # -----------------------------------------------------------------------
     # 3. Get PRS
-    # GET /prs?id_mahasiswa=&id_semester=
+    # GET /prs/<id_mahasiswa>/<id_semester>
     # -----------------------------------------------------------------------
 
     @http("GET", "/prs/<int:id_mahasiswa>/<int:id_semester>")
     def get_prs(self, request, id_mahasiswa, id_semester):
-        if not id_mahasiswa or not id_semester:
-            return 400, json.dumps({"success": False, "error": "Parameter id_mahasiswa dan id_semester wajib diisi"})
-
         result = self.prs_rpc.get_prs(id_mahasiswa, id_semester)
         if "error" in result:
             return 404, json.dumps({"success": False, "error": result["error"]})
@@ -103,15 +106,11 @@ class GatewayService:
 
     # -----------------------------------------------------------------------
     # 4. Get PRS Detail by semester
-    # GET /prs/detail?id_semester=
+    # GET /prs/detail/<int:id_semester>
     # -----------------------------------------------------------------------
 
-    @http("GET", "/prs/detail")
-    def get_prs_detail_by_semester(self, request):
-        id_semester = request.args.get("id_semester", type=int)
-        if not id_semester:
-            return 400, json.dumps({"success": False, "error": "Parameter id_semester wajib diisi"})
-
+    @http("GET", "/prs/detail/<int:id_semester>")
+    def get_prs_detail_by_semester(self, id_semester):
         result = self.prs_rpc.get_prs_detail_by_semester(id_semester)
         return dumps({"success": True, "data": result})
 
@@ -154,27 +153,39 @@ class GatewayService:
         return dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------
-    # 8. Verify PRS
-    # POST /prs/<id_prs>/verify
+    # 8. Verify single PRS (auto)
+    # PUT /prs/<id_prs>/verify
+    #
+    # PUT because this is an idempotent update to an existing resource.
+    # Running it twice produces the same result — correct PUT semantics.
+    # No request body needed; all logic is driven by existing DB state.
     # -----------------------------------------------------------------------
 
-    @http("POST", "/prs/<int:id_prs>/verify")
+    @http("PUT", "/prs/<int:id_prs>/verify")
     def verify_prs(self, request, id_prs):
-        body = json.loads(request.get_data(as_text=True) or "{}")
-        if "verifikasi" not in body:
-            return 400, json.dumps({"success": False, "error": "Field verifikasi (list) wajib diisi"})
-
-        result = self.prs_rpc.verify_prs(
-            id_prs=id_prs,
-            verifikasi=body["verifikasi"],
-            komentar=body.get("komentar"),
-        )
+        result = self.prs_rpc.verify_prs(id_prs=id_prs)
         if "error" in result:
             return 400, json.dumps({"success": False, "error": result["error"]})
         return dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------
-    # 9. Push peserta to transkrip
+    # 9. Verify all PRS in a semester (auto, shared capacity pool)
+    # POST /prs/semester/<id_semester>/verify
+    #
+    # POST because this is a bulk operation that triggers a significant
+    # state transition across many resources — not idempotent (running it
+    # twice after changes would re-evaluate changed state).
+    # -----------------------------------------------------------------------
+
+    @http("POST", "/prs/semester/<int:id_semester>/verify")
+    def verify_prs_by_semester(self, request, id_semester):
+        result = self.prs_rpc.verify_prs_by_semester(id_semester=id_semester)
+        if "error" in result:
+            return 400, json.dumps({"success": False, "error": result["error"]})
+        return dumps({"success": True, "data": result})
+
+    # -----------------------------------------------------------------------
+    # 10. Push peserta to transkrip
     # POST /prs/transkrip/<id_semester>
     # -----------------------------------------------------------------------
 
@@ -184,9 +195,9 @@ class GatewayService:
         if "error" in result:
             return 404, json.dumps({"success": False, "error": result["error"]})
         return dumps({"success": True, "data": result})
-    
+
     # -----------------------------------------------------------------------
-    # 10. Snapshot jadwal (internal helper exposed for inter-service use)
+    # 11. Snapshot jadwal
     # POST /prs/detail/<id_detail_prs>/jadwal/snapshot
     # -----------------------------------------------------------------------
 
@@ -217,9 +228,9 @@ class GatewayService:
         if "error" in result:
             return 400, json.dumps({"success": False, "error": result["error"]})
         return 201, dumps({"success": True, "data": result})
-    
+
     # -----------------------------------------------------------------------
-    # 11. Sync jadwal snapshot
+    # 12. Sync jadwal snapshot
     # POST /prs/jadwal/snapshot/<id_detail_prs>
     # -----------------------------------------------------------------------
 
@@ -252,7 +263,7 @@ class GatewayService:
         return dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------
-    # 12. Debug dump
+    # 13. Debug dump
     # GET /debug/dump
     # -----------------------------------------------------------------------
 

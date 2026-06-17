@@ -2,23 +2,25 @@
 service.py — Nameko RPC microservice for PRS (Pembuatan Rencana Studi).
 
 Tables owned:
-    prs         — header per mahasiswa per semester
-    prs_detail  — kelas yang diambil, with prioritas & status_validasi
-    jadwal_ss   — snapshot jadwal from Penawaran Kelas at enrollment time
+    prs           — header per mahasiswa per semester
+    prs_detail    — kelas yang diambil, with prioritas & status_validasi
+    jadwal_ss     — snapshot jadwal from Penawaran Kelas at enrollment time
+    kelas_config  — kapasitas per kelas (default 40; future: synced from Penawaran Kelas)
 
-Exposed RPC methods (mapped from function matrix):
-    1. create_prs               — insert PRS header (status=draft)
-    2. create_prs_detail        — insert one kelas into a PRS
-    3. get_prs                  — fetch PRS header by id_mahasiswa + id_semester
-    4. get_prs_detail_by_semester  — all details for a given semester
-    5. get_prs_detail_by_prs_id    — all details for a given id_prs
-    6. get_prs_detail_by_kelas_id  — all details for a given id_kelas (across all PRS)
-    7. get_jumlah_mahasiswa_per_kelas — count students enrolled per kelas
-    8. verify_prs               — approve/reject detail lines + add comment, update total_sks
-    9. push_peserta_to_transkrip — mark validated PRS details as finalized (triggers transkrip)
-    10. snapshot_jadwal          — snapshot jadwal from Penawaran Kelas into jadwal_ss
-    11. sync_jadwal_snapshot      — update jadwal_ss when Penawaran Kelas notifies of jadwal change
-    12. debug_dump               — dump all PRS + details + jadwal_ss
+Exposed RPC methods:
+    1.  create_prs                  — insert PRS header (status=draft)
+    2.  create_prs_detail           — insert one kelas into a PRS
+    3.  get_prs                     — fetch PRS header by id_mahasiswa + id_semester
+    4.  get_prs_detail_by_semester  — all details for a given semester
+    5.  get_prs_detail_by_prs_id    — all details for a given id_prs
+    6.  get_prs_detail_by_kelas_id  — all details for a given id_kelas (across all PRS)
+    7.  get_jumlah_mahasiswa_per_kelas — count students enrolled per kelas
+    8.  verify_prs                  — auto-verify a single student PRS (priority + cap + SKS)
+    9.  verify_prs_by_semester      — auto-verify all PRS in a semester (shared capacity pool)
+    10. push_peserta_to_transkrip   — return validated enrollments for Transkrip service
+    11. snapshot_jadwal             — snapshot jadwal into jadwal_ss
+    12. sync_jadwal_snapshot        — update jadwal_ss when Penawaran Kelas changes a jadwal
+    13. debug_dump                  — dump all rows (dev only)
 """
 
 import os
@@ -30,6 +32,13 @@ from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_SKS = 24          # default max SKS per student per semester
+DEFAULT_KAPASITAS = 40  # default class capacity (stored in kelas_config, see schema)
+
 
 # ---------------------------------------------------------------------------
 # Service
@@ -40,11 +49,13 @@ class PRSService:
 
     name = "prs_service"
 
-    # NOTE: This proxy is currently UNUSED for real calls — create_prs_detail
-    # uses dummy jadwal data (see TODO there) until Penawaran Kelas exposes
-    # its jadwal-fetching RPC method. Once available, swap the dummy block
-    # in create_prs_detail for a call to self.penawaran_kelas_rpc.<method_name>.
+    # NOTE: Unused for real calls until Penawaran Kelas exposes its RPC.
+    # Swap dummy jadwal block in create_prs_detail once available.
     penawaran_kelas_rpc = RpcProxy("penawaran_kelas_service")
+
+    # -----------------------------------------------------------------------
+    # DB helper
+    # -----------------------------------------------------------------------
 
     def _db(self):
         return pymysql.connect(
@@ -85,7 +96,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 2. Create PRS_Detail
+    # 2. Create PRS Detail
     # -----------------------------------------------------------------------
 
     @rpc
@@ -98,7 +109,6 @@ class PRSService:
         db = self._db()
         try:
             with db.cursor() as cur:
-                # Guard: PRS must be in draft
                 cur.execute(
                     "SELECT status FROM prs WHERE id_prs = %s FOR UPDATE",
                     (id_prs,),
@@ -109,7 +119,6 @@ class PRSService:
                 if prs["status"] != "draft":
                     return {"error": f"PRS status '{prs['status']}', hanya bisa tambah kelas saat draft"}
 
-                # Guard: prioritas must be 1, 2, or 3
                 if prioritas not in (1, 2, 3):
                     return {"error": "Prioritas harus 1, 2, atau 3"}
 
@@ -122,20 +131,12 @@ class PRSService:
                 id_detail = cur.lastrowid
 
                 # ------------------------------------------------------------
-                # DUMMY DATA — jadwal snapshot at enrollment time
+                # DUMMY DATA — replace with real RPC once Penawaran Kelas
+                # exposes get_jadwal_by_kelas(id_kelas).
                 # ------------------------------------------------------------
-                # TODO: This is placeholder data. Once Penawaran Kelas exposes
-                # its RPC method (e.g. get_jadwal_by_kelas), replace the line
-                # below with:
-                #
-                #     jadwal_list = self.penawaran_kelas_rpc.get_jadwal_by_kelas(id_kelas)
-                #
-                # Make sure the dicts returned have the keys expected by
-                # _snapshot_jadwal: id_jadwal, hari, jam_mulai, jam_selesai,
-                # ruangan, tipe.
                 jadwal_list = [
                     {
-                        "id_jadwal": id_kelas * 1000 + 1,  # dummy unique id
+                        "id_jadwal": id_kelas * 1000 + 1,
                         "hari": "Senin",
                         "jam_mulai": "08:00:00",
                         "jam_selesai": "09:40:00",
@@ -161,35 +162,26 @@ class PRSService:
 
     @rpc
     def get_prs(self, id_mahasiswa, id_semester):
-        """
-        Fetch PRS header for a given mahasiswa + semester.
-        Returns the PRS row including status and total_sks.
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
                 cur.execute(
-                    """SELECT * FROM prs
-                       WHERE id_mahasiswa = %s AND id_semester = %s""",
+                    "SELECT * FROM prs WHERE id_mahasiswa = %s AND id_semester = %s",
                     (id_mahasiswa, id_semester),
                 )
                 row = cur.fetchone()
                 if not row:
                     return {"error": "PRS tidak ditemukan"}
-                return row
+                return self._serialize_row(row)
         finally:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 4. Fetch PRS_Detail by semester_id
+    # 4. Fetch PRS Detail by semester
     # -----------------------------------------------------------------------
 
     @rpc
     def get_prs_detail_by_semester(self, id_semester):
-        """
-        Fetch all PRS_Detail rows for an entire semester.
-        Useful for dosen wali to see all student enrollments in one semester.
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
@@ -201,19 +193,16 @@ class PRSService:
                        ORDER BY p.id_mahasiswa, pd.prioritas""",
                     (id_semester,),
                 )
-                return cur.fetchall()
+                return [self._serialize_row(r) for r in cur.fetchall()]
         finally:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 5. Fetch PRS_Detail by prs_id
+    # 5. Fetch PRS Detail by prs_id
     # -----------------------------------------------------------------------
 
     @rpc
     def get_prs_detail_by_prs_id(self, id_prs):
-        """
-        Fetch all detail lines for a single PRS (one student, one semester).
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
@@ -226,20 +215,16 @@ class PRSService:
                 rows = cur.fetchall()
                 if not rows:
                     return {"error": "Tidak ada detail untuk PRS ini"}
-                return rows
+                return [self._serialize_row(r) for r in rows]
         finally:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 6. Fetch PRS_Detail by kelas_id
+    # 6. Fetch PRS Detail by kelas
     # -----------------------------------------------------------------------
 
     @rpc
     def get_prs_detail_by_kelas_id(self, id_kelas):
-        """
-        Fetch all PRS_Detail rows for a given kelas across all students.
-        Used to check who has enrolled in a specific kelas.
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
@@ -251,29 +236,22 @@ class PRSService:
                        ORDER BY p.id_mahasiswa""",
                     (id_kelas,),
                 )
-                return cur.fetchall()
+                return [self._serialize_row(r) for r in cur.fetchall()]
         finally:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 7. Fetch Jumlah Mahasiswa per kelas
+    # 7. Jumlah mahasiswa per kelas
     # -----------------------------------------------------------------------
 
     @rpc
     def get_jumlah_mahasiswa_per_kelas(self, id_kelas=None):
-        """
-        Count enrolled students per kelas.
-        - If id_kelas is given: returns count for that specific kelas.
-        - If not given: returns count for ALL kelas (useful for capacity checks).
-        Only counts rows with status_validasi='approved'.
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
                 if id_kelas:
                     cur.execute(
-                        """SELECT id_kelas,
-                                  COUNT(*) AS jumlah_mahasiswa
+                        """SELECT id_kelas, COUNT(*) AS jumlah_mahasiswa
                            FROM prs_detail
                            WHERE id_kelas = %s AND status_validasi = 'approved'
                            GROUP BY id_kelas""",
@@ -283,8 +261,7 @@ class PRSService:
                     return row if row else {"id_kelas": id_kelas, "jumlah_mahasiswa": 0}
                 else:
                     cur.execute(
-                        """SELECT id_kelas,
-                                  COUNT(*) AS jumlah_mahasiswa
+                        """SELECT id_kelas, COUNT(*) AS jumlah_mahasiswa
                            FROM prs_detail
                            WHERE status_validasi = 'approved'
                            GROUP BY id_kelas
@@ -295,35 +272,34 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 8. Verify PRS (approve / reject detail lines, add comment)
+    # 8. Verify PRS — single student, auto-logic
     # -----------------------------------------------------------------------
 
     @rpc
-    def verify_prs(self, id_prs, verifikasi, komentar=None):
+    def verify_prs(self, id_prs):
         """
-        Dosen wali verifies a PRS by approving/rejecting individual detail lines.
+        Auto-verify a single student's PRS using priority + capacity + SKS rules.
 
-        id_prs      : int
-        verifikasi  : list of dicts, e.g.:
-                      [
-                        {"id_detail_prs": 1, "status_validasi": "approved"},
-                        {"id_detail_prs": 2, "status_validasi": "rejected"},
-                      ]
-        komentar    : optional string comment stored on the PRS header
+        Algorithm (per mata kuliah group):
+          - Sort detail lines for each id_mata_kuliah by prioritas ASC.
+          - Try prioritas 1 first: approve if the kelas has remaining capacity
+            AND student's running total_sks + sks <= MAX_SKS.
+          - If that fails, try prioritas 2, then 3.
+          - The first passing line is approved; all others for that mata kuliah
+            are rejected.
+          - If none pass, all lines for that mata kuliah are rejected.
 
-        Logic:
-          - Each detail line gets its status_validasi updated.
-          - PRS.total_sks is recalculated from approved lines only.
-          - PRS.status is set to 'validated' if at least one line is approved,
-            otherwise remains 'process'.
+        Capacity is read from kelas_config (falls back to DEFAULT_KAPASITAS).
+        Already-approved enrollments from OTHER PRS count against capacity.
+
+        PRS status after verification:
+          - 'validated'  → at least one line approved
+          - 'process'    → all lines rejected (dosen wali may intervene manually)
         """
-        if not verifikasi or not isinstance(verifikasi, list):
-            return {"error": "Parameter verifikasi harus berupa list"}
-
         db = self._db()
         try:
             with db.cursor() as cur:
-                # Ensure PRS exists and is in 'process'
+                # Lock and fetch the PRS
                 cur.execute(
                     "SELECT * FROM prs WHERE id_prs = %s FOR UPDATE",
                     (id_prs,),
@@ -331,43 +307,78 @@ class PRSService:
                 prs = cur.fetchone()
                 if not prs:
                     return {"error": "PRS tidak ditemukan"}
-                if prs["status"] not in ("process", "draft"):
-                    return {"error": f"PRS status '{prs['status']}', tidak bisa diverifikasi"}
+                if prs["status"] == "validated":
+                    return {"error": "PRS sudah divalidasi sebelumnya"}
 
-                # Update each detail line
-                for item in verifikasi:
-                    sv = item.get("status_validasi")
-                    if sv not in ("approved", "rejected", "pending"):
-                        return {"error": f"status_validasi tidak valid: {sv}"}
+                # Fetch all detail lines ordered by mata kuliah, then prioritas
+                cur.execute(
+                    """SELECT * FROM prs_detail
+                       WHERE id_prs = %s
+                       ORDER BY id_mata_kuliah, prioritas, id_detail_prs""",
+                    (id_prs,),
+                )
+                details = cur.fetchall()
+                if not details:
+                    return {"error": "PRS tidak memiliki detail kelas"}
+
+                # Group lines by id_mata_kuliah
+                groups = {}
+                for d in details:
+                    groups.setdefault(d["id_mata_kuliah"], []).append(d)
+
+                approved_ids = []
+                rejected_ids = []
+                total_sks = 0
+
+                for mk_id, lines in groups.items():
+                    approved = False
+                    for line in lines:
+                        # Skip if adding this SKS would exceed the cap
+                        if total_sks + line["sks"] > MAX_SKS:
+                            continue
+
+                        # Check current approved count for this kelas
+                        cap = self._get_kapasitas(cur, line["id_kelas"])
+                        cur.execute(
+                            """SELECT COUNT(*) AS cnt FROM prs_detail
+                               WHERE id_kelas = %s AND status_validasi = 'approved'""",
+                            (line["id_kelas"],),
+                        )
+                        enrolled = cur.fetchone()["cnt"]
+                        if enrolled >= cap:
+                            continue  # Full — try next prioritas
+
+                        # This line passes — approve it
+                        approved_ids.append(line["id_detail_prs"])
+                        total_sks += line["sks"]
+                        approved = True
+                        break  # Don't try lower-priority lines
+
+                    if not approved:
+                        rejected_ids.extend(l["id_detail_prs"] for l in lines)
+                    else:
+                        # Reject remaining lines for this mata kuliah
+                        for line in lines:
+                            if line["id_detail_prs"] not in approved_ids:
+                                rejected_ids.append(line["id_detail_prs"])
+
+                # Apply updates
+                if approved_ids:
                     cur.execute(
-                        """UPDATE prs_detail
-                           SET status_validasi = %s
-                           WHERE id_detail_prs = %s AND id_prs = %s""",
-                        (sv, item["id_detail_prs"], id_prs),
+                        f"""UPDATE prs_detail SET status_validasi = 'approved'
+                            WHERE id_detail_prs IN ({','.join(['%s']*len(approved_ids))})""",
+                        approved_ids,
+                    )
+                if rejected_ids:
+                    cur.execute(
+                        f"""UPDATE prs_detail SET status_validasi = 'rejected'
+                            WHERE id_detail_prs IN ({','.join(['%s']*len(rejected_ids))})""",
+                        rejected_ids,
                     )
 
-                # Recalculate total_sks from approved lines
+                new_status = "validated" if approved_ids else "process"
                 cur.execute(
-                    """SELECT COALESCE(SUM(sks), 0) AS total
-                       FROM prs_detail
-                       WHERE id_prs = %s AND status_validasi = 'approved'""",
-                    (id_prs,),
-                )
-                total_sks = cur.fetchone()["total"]
-
-                # Determine new PRS status
-                cur.execute(
-                    """SELECT COUNT(*) AS cnt FROM prs_detail
-                       WHERE id_prs = %s AND status_validasi = 'approved'""",
-                    (id_prs,),
-                )
-                has_approved = cur.fetchone()["cnt"] > 0
-                new_status = "validated" if has_approved else "process"
-
-                cur.execute(
-                    """UPDATE prs
-                       SET status = %s, total_sks = %s
-                       WHERE id_prs = %s""",
+                    "UPDATE prs SET status = %s, total_sks = %s WHERE id_prs = %s",
                     (new_status, total_sks, id_prs),
                 )
 
@@ -377,7 +388,8 @@ class PRSService:
                 "id_prs": id_prs,
                 "status": new_status,
                 "total_sks": total_sks,
-                "komentar": komentar,
+                "approved": approved_ids,
+                "rejected": rejected_ids,
             }
         except pymysql.Error as e:
             db.rollback()
@@ -386,22 +398,167 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 9. Push peserta to transkrip
+    # 9. Verify PRS by semester — all students, shared capacity pool
+    # -----------------------------------------------------------------------
+
+    @rpc
+    def verify_prs_by_semester(self, id_semester):
+        """
+        Auto-verify ALL pending PRS in a semester using the same
+        priority + capacity + SKS rules as verify_prs, but with a
+        SHARED capacity pool across all students.
+
+        Processing order: id_mahasiswa ASC (fair FIFO — first registered
+        gets priority when multiple students want the same full kelas).
+
+        Only processes PRS with status 'draft' or 'process'.
+        Already-validated PRS are skipped.
+
+        Returns a per-PRS summary of what was approved/rejected.
+        """
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                # Fetch all eligible PRS for this semester, ordered fairly
+                cur.execute(
+                    """SELECT * FROM prs
+                       WHERE id_semester = %s
+                         AND status IN ('draft', 'process')
+                       ORDER BY id_mahasiswa ASC
+                       FOR UPDATE""",
+                    (id_semester,),
+                )
+                all_prs = cur.fetchall()
+
+                if not all_prs:
+                    return {"error": "Tidak ada PRS yang perlu diverifikasi untuk semester ini"}
+
+                # ----------------------------------------------------------------
+                # Capacity tracker: shared across all students in this run.
+                # Seed with already-approved enrollments from validated PRS
+                # so we don't double-count seats.
+                # ----------------------------------------------------------------
+                cur.execute(
+                    """SELECT pd.id_kelas, COUNT(*) AS cnt
+                       FROM prs_detail pd
+                       JOIN prs p ON pd.id_prs = p.id_prs
+                       WHERE p.id_semester = %s
+                         AND p.status = 'validated'
+                         AND pd.status_validasi = 'approved'
+                       GROUP BY pd.id_kelas""",
+                    (id_semester,),
+                )
+                # enrolled_counts[id_kelas] = how many seats already taken
+                enrolled_counts = {r["id_kelas"]: r["cnt"] for r in cur.fetchall()}
+
+                results = []
+
+                for prs in all_prs:
+                    id_prs = prs["id_prs"]
+
+                    cur.execute(
+                        """SELECT * FROM prs_detail
+                           WHERE id_prs = %s
+                           ORDER BY id_mata_kuliah, prioritas, id_detail_prs""",
+                        (id_prs,),
+                    )
+                    details = cur.fetchall()
+
+                    if not details:
+                        results.append({
+                            "id_prs": id_prs,
+                            "id_mahasiswa": prs["id_mahasiswa"],
+                            "status": "skipped",
+                            "reason": "Tidak ada detail kelas",
+                        })
+                        continue
+
+                    # Group by mata kuliah
+                    groups = {}
+                    for d in details:
+                        groups.setdefault(d["id_mata_kuliah"], []).append(d)
+
+                    approved_ids = []
+                    rejected_ids = []
+                    total_sks = 0
+
+                    for mk_id, lines in groups.items():
+                        approved = False
+                        for line in lines:
+                            if total_sks + line["sks"] > MAX_SKS:
+                                continue
+
+                            id_kelas = line["id_kelas"]
+                            cap = self._get_kapasitas(cur, id_kelas)
+                            current_enrolled = enrolled_counts.get(id_kelas, 0)
+                            if current_enrolled >= cap:
+                                continue
+
+                            # Approve
+                            approved_ids.append(line["id_detail_prs"])
+                            total_sks += line["sks"]
+                            enrolled_counts[id_kelas] = current_enrolled + 1  # update shared pool
+                            approved = True
+                            break
+
+                        if not approved:
+                            rejected_ids.extend(l["id_detail_prs"] for l in lines)
+                        else:
+                            for line in lines:
+                                if line["id_detail_prs"] not in approved_ids:
+                                    rejected_ids.append(line["id_detail_prs"])
+
+                    # Apply DB updates for this PRS
+                    if approved_ids:
+                        cur.execute(
+                            f"""UPDATE prs_detail SET status_validasi = 'approved'
+                                WHERE id_detail_prs IN ({','.join(['%s']*len(approved_ids))})""",
+                            approved_ids,
+                        )
+                    if rejected_ids:
+                        cur.execute(
+                            f"""UPDATE prs_detail SET status_validasi = 'rejected'
+                                WHERE id_detail_prs IN ({','.join(['%s']*len(rejected_ids))})""",
+                            rejected_ids,
+                        )
+
+                    new_status = "validated" if approved_ids else "process"
+                    cur.execute(
+                        "UPDATE prs SET status = %s, total_sks = %s WHERE id_prs = %s",
+                        (new_status, total_sks, id_prs),
+                    )
+
+                    results.append({
+                        "id_prs": id_prs,
+                        "id_mahasiswa": prs["id_mahasiswa"],
+                        "status": new_status,
+                        "total_sks": total_sks,
+                        "approved": approved_ids,
+                        "rejected": rejected_ids,
+                    })
+
+            db.commit()
+            return {
+                "message": f"Verifikasi semester {id_semester} selesai",
+                "id_semester": id_semester,
+                "total_prs_diproses": len(results),
+                "hasil": results,
+            }
+        except pymysql.Error as e:
+            db.rollback()
+            return {"error": str(e)}
+        finally:
+            db.close()
+
+    # -----------------------------------------------------------------------
+    # 10. Push peserta to transkrip
     # -----------------------------------------------------------------------
 
     @rpc
     def push_peserta_to_transkrip(self, id_semester):
         """
         Collect all validated PRS details for a semester and return them
-        as a list ready to be pushed to the Transkrip service.
-
-        Only returns details where:
-          - prs.status = 'validated'
-          - prs_detail.status_validasi = 'approved'
-
-        The Transkrip service is responsible for consuming this data.
-        This method only reads (R) from prs + prs_detail; the actual
-        write to transkrip happens in the Transkrip service via RPC.
+        ready to be pushed to the Transkrip service.
         """
         db = self._db()
         try:
@@ -434,18 +591,13 @@ class PRSService:
             }
         finally:
             db.close()
-            
 
     # -----------------------------------------------------------------------
-    # 10. Snapshot jadwal into jadwal_ss (called inside create_prs_detail)
+    # 11. Snapshot jadwal (internal helper + public RPC wrapper)
     # -----------------------------------------------------------------------
 
     def _snapshot_jadwal(self, db, id_detail_prs, jadwal_list):
-        """
-        Internal helper — snapshots jadwal from Penawaran Kelas into jadwal_ss.
-        jadwal_list: list of dicts with keys:
-            id_jadwal, hari, jam_mulai, jam_selesai, ruangan, tipe
-        """
+        """Internal — inserts jadwal rows into jadwal_ss within an open transaction."""
         with db.cursor() as cur:
             for j in jadwal_list:
                 cur.execute(
@@ -463,13 +615,10 @@ class PRSService:
                         j["tipe"],
                     ),
                 )
-                
+
     @rpc
     def snapshot_jadwal(self, id_detail_prs, jadwal_list):
-        """
-        Public RPC wrapper around _snapshot_jadwal.
-        Called by Penawaran Kelas when a new jadwal is created.
-        """
+        """Public RPC — called by Penawaran Kelas when a new jadwal is created."""
         db = self._db()
         try:
             self._snapshot_jadwal(db, id_detail_prs, jadwal_list)
@@ -482,25 +631,20 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 11. Sync jadwal snapshot (called when Penawaran Kelas updates a jadwal)
+    # 12. Sync jadwal snapshot
     # -----------------------------------------------------------------------
 
     @rpc
     def sync_jadwal_snapshot(self, id_detail_prs, jadwal_list):
         """
         Updates jadwal_ss when Penawaran Kelas notifies of a jadwal change.
-        Edits existing rows in-place using id_jadwal as the stable key.
-        Removes rows that no longer exist in the new jadwal_list.
-
-        jadwal_list: list of dicts with keys:
-            id_jadwal, hari, jam_mulai, jam_selesai, ruangan, tipe
+        Deletes rows removed from the new list; upserts the rest.
         """
         db = self._db()
         try:
             with db.cursor() as cur:
                 incoming_ids = [j["id_jadwal"] for j in jadwal_list]
 
-                # Remove rows that are no longer in the new jadwal_list
                 if incoming_ids:
                     placeholders = ",".join(["%s"] * len(incoming_ids))
                     cur.execute(
@@ -508,7 +652,6 @@ class PRSService:
                         [id_detail_prs, *incoming_ids],
                     )
                 else:
-                    # No jadwal at all — wipe everything for this detail
                     cur.execute(
                         "DELETE FROM jadwal_ss WHERE id_detail_prs = %s",
                         (id_detail_prs,),
@@ -517,38 +660,20 @@ class PRSService:
                 for j in jadwal_list:
                     cur.execute(
                         """UPDATE jadwal_ss
-                               SET jam_mulai   = %s,
-                                   jam_selesai = %s,
-                                   hari        = %s,
-                                   ruangan     = %s,
-                                   tipe        = %s,
-                                   is_outdated = 0
+                               SET jam_mulai = %s, jam_selesai = %s,
+                                   hari = %s, ruangan = %s, tipe = %s, is_outdated = 0
                            WHERE id_jadwal = %s AND id_detail_prs = %s""",
-                        (
-                            j["jam_mulai"],
-                            j["jam_selesai"],
-                            j["hari"],
-                            j["ruangan"],
-                            j["tipe"],
-                            j["id_jadwal"],
-                            id_detail_prs,
-                        ),
+                        (j["jam_mulai"], j["jam_selesai"], j["hari"],
+                         j["ruangan"], j["tipe"], j["id_jadwal"], id_detail_prs),
                     )
-                    if cur.rowcount == 0:  # Row didn't exist — insert fresh
+                    if cur.rowcount == 0:
                         cur.execute(
                             """INSERT INTO jadwal_ss
                                    (id_jadwal, id_detail_prs, jam_mulai, jam_selesai,
                                     hari, ruangan, tipe, is_outdated)
                                VALUES (%s, %s, %s, %s, %s, %s, %s, 0)""",
-                            (
-                                j["id_jadwal"],
-                                id_detail_prs,
-                                j["jam_mulai"],
-                                j["jam_selesai"],
-                                j["hari"],
-                                j["ruangan"],
-                                j["tipe"],
-                            ),
+                            (j["id_jadwal"], id_detail_prs, j["jam_mulai"],
+                             j["jam_selesai"], j["hari"], j["ruangan"], j["tipe"]),
                         )
 
             db.commit()
@@ -560,15 +685,11 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 12. Debug — dump all PRS, PRS_Detail, and Jadwal_SS
+    # 13. Debug dump
     # -----------------------------------------------------------------------
 
     @rpc
     def debug_dump(self):
-        """
-        Returns all rows from prs, prs_detail, and jadwal_ss as separate tables.
-        For debugging only — do not expose in production.
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
@@ -581,23 +702,46 @@ class PRSService:
                 cur.execute("SELECT * FROM jadwal_ss ORDER BY id_detail_prs, id_jadwal_ss")
                 all_jadwal = cur.fetchall()
 
+                cur.execute("SELECT * FROM kelas_config ORDER BY id_kelas")
+                all_config = cur.fetchall()
+
             return {
                 "prs": [self._serialize_row(r) for r in all_prs],
                 "prs_detail": [self._serialize_row(r) for r in all_detail],
                 "jadwal_ss": [self._serialize_row(r) for r in all_jadwal],
+                "kelas_config": [self._serialize_row(r) for r in all_config],
             }
         finally:
             db.close()
 
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
+
+    def _get_kapasitas(self, cur, id_kelas):
+        """
+        Fetch kelas capacity from kelas_config.
+        Falls back to DEFAULT_KAPASITAS if not configured.
+
+        TODO: When Penawaran Kelas exposes kapasitas via RPC, sync it into
+        kelas_config at enrollment time (similar to how jadwal_ss is populated).
+        """
+        cur.execute(
+            "SELECT kapasitas FROM kelas_config WHERE id_kelas = %s",
+            (id_kelas,),
+        )
+        row = cur.fetchone()
+        return row["kapasitas"] if row else DEFAULT_KAPASITAS
+
     @staticmethod
     def _serialize_row(row):
-        """Convert datetime/timedelta values in a row dict to JSON-safe strings."""
+        """Convert datetime/timedelta values to JSON-safe strings."""
         out = {}
         for k, v in row.items():
             if isinstance(v, (datetime, date)):
                 out[k] = v.isoformat()
             elif isinstance(v, timedelta):
-                out[k] = str(v)  # e.g. "8:00:00"
+                out[k] = str(v)
             else:
                 out[k] = v
         return out
