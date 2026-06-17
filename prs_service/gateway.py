@@ -5,14 +5,14 @@ Routes:
   GET    /health
   POST   /prs                                        → create_prs
   POST   /prs/<id_prs>/detail                        → create_prs_detail
-  GET    /prs/<id_mahasiswa>/<id_semester>            → get_prs
-  GET    /prs/detail/<id_semester>              → get_prs_detail_by_semester
+  GET    /prs/<id_mahasiswa>/<id_semester>           → get_prs
+  GET    /prs/detail/<id_semester>                   → get_prs_detail_by_semester
   GET    /prs/<id_prs>/detail                        → get_prs_detail_by_prs_id
   GET    /prs/detail/kelas/<id_kelas>                → get_prs_detail_by_kelas_id
   GET    /prs/kelas/<id_kelas>/jumlah                → get_jumlah_mahasiswa_per_kelas
   GET    /prs/kelas/jumlah                           → get_jumlah_mahasiswa_per_kelas (all)
   PUT    /prs/<id_prs>/verify                        → verify_prs          (single student, auto)
-  POST   /prs/semester/<id_semester>/verify          → verify_prs_by_semester (whole semester)
+  PUT   /prs/semester/<id_semester>/verify           → verify_prs_by_semester (whole semester)
   POST   /prs/transkrip/<id_semester>                → push_peserta_to_transkrip
   POST   /prs/detail/<id_detail_prs>/jadwal/snapshot → snapshot_jadwal
   POST   /prs/jadwal/snapshot/<id_detail_prs>        → sync_jadwal_snapshot
@@ -170,14 +170,14 @@ class GatewayService:
 
     # -----------------------------------------------------------------------
     # 9. Verify all PRS in a semester (auto, shared capacity pool)
-    # POST /prs/semester/<id_semester>/verify
+    # PUT /prs/semester/<id_semester>/verify
     #
-    # POST because this is a bulk operation that triggers a significant
+    # PUT because this is a bulk operation that triggers a significant
     # state transition across many resources — not idempotent (running it
     # twice after changes would re-evaluate changed state).
     # -----------------------------------------------------------------------
 
-    @http("POST", "/prs/semester/<int:id_semester>/verify")
+    @http("PUT", "/prs/semester/<int:id_semester>/verify")
     def verify_prs_by_semester(self, request, id_semester):
         result = self.prs_rpc.verify_prs_by_semester(id_semester=id_semester)
         if "error" in result:

@@ -4,9 +4,28 @@ A microservice-based academic study plan system built with Nameko, RabbitMQ, Fla
 
 ---
 
+## Architecture
+ 
+```
+HTTP Client
+    │
+    ▼
+[ gateway.py ]  ← HTTP layer (Nameko web handlers)
+    │  RpcProxy("prs_service")
+    ▼
+[ service.py ]  ← Business logic (Nameko RPC service)
+    │
+    ▼
+[ MySQL: prs_db ]  ← Persistent storage
+```
+ 
+The gateway exposes HTTP endpoints and forwards all calls to `prs_service` via RabbitMQ RPC. The service layer handles all database operations.
+ 
+---
+
 ## Prerequisites
 
-Before running this project, make sure you have the following installed:
+If your planning to run this on your window device, make sure you have this:
 
 ### 1. WSL (Windows Subsystem for Linux)
 Required for running Docker on Windows.
@@ -41,7 +60,7 @@ Used to build and run the containers.
 
 3. Start all containers:
    ```bash
-   docker compose up --build
+   docker compose up -d
    ```
 
 4. Wait until you see:
@@ -53,6 +72,8 @@ Used to build and run the containers.
 5. The API is now available at:
    ```
    http://localhost:5000
+   or
+   http://<public_ip>:5000
    ```
 
 ---
@@ -78,14 +99,15 @@ docker compose up --build
 |---|---|---|
 | GET | `/health` | Health check |
 | POST | `/prs` | Create new PRS |
-| GET | `/prs?id_mahasiswa=&id_semester=` | Get PRS header |
+| GET | `/prs/<id_mahasiswa>/<id_semester>` | Get PRS header |
 | POST | `/prs/<id_prs>/detail` | Add kelas to PRS |
 | GET | `/prs/<id_prs>/detail` | Get detail by PRS |
-| GET | `/prs/detail?id_semester=` | Get detail by semester |
+| GET | `/prs/detail/<id_semester>` | Get detail by semester |
 | GET | `/prs/detail/kelas/<id_kelas>` | Get detail by kelas |
 | GET | `/prs/kelas/<id_kelas>/jumlah` | Count students in a kelas |
 | GET | `/prs/kelas/jumlah` | Count students in all kelas |
-| POST | `/prs/<id_prs>/verify` | Approve/reject detail lines |
+| PUT | `/prs/<id_prs>/verify` | Approve/reject detail lines |
+| PUT | `/prs/semester/<id_semester>/verify` | Approve/reject detail lines |
 | POST | `/prs/transkrip/<id_semester>` | Push validated peserta to transkrip |
 | POST | `/prs/detail/<id_detail_prs>/jadwal/snapshot` | Snapshot a new jadwal into `jadwal_ss` |
 | POST | `/prs/jadwal/snapshot/<id_detail_prs>` | Sync `jadwal_ss` when jadwal changes (edits in place) |
