@@ -14,6 +14,7 @@ Routes:
   PUT    /prs/<id_prs>/verify                        → verify_prs          (single student, auto)
   PUT   /prs/semester/<id_semester>/verify           → verify_prs_by_semester (whole semester)
   POST   /prs/transkrip/<id_semester>                → push_peserta_to_transkrip
+  PUT    /prs/jadwal/invalidate/<id_kelas>           → invalidate_jadwal
   POST   /prs/detail/<id_detail_prs>/jadwal/snapshot → snapshot_jadwal
   POST   /prs/jadwal/snapshot/<id_detail_prs>        → sync_jadwal_snapshot
   GET    /debug/dump                                 → debug_dump
@@ -195,9 +196,21 @@ class GatewayService:
         if "error" in result:
             return 404, json.dumps({"success": False, "error": result["error"]})
         return dumps({"success": True, "data": result})
+    
+    # -----------------------------------------------------------------------
+    # 11. Invalidate jadwal snapshot
+    # PUT /prs/jadwal/invalidate/<int:id_kelas>
+    # -----------------------------------------------------------------------
+    
+    @http("PUT", "/prs/jadwal/invalidate/<int:id_kelas>")
+    def invalidate_jadwal(self, request, id_kelas):
+        result = self.prs_rpc.invalidate_jadwal_snapshot(id_kelas=id_kelas)
+        if "error" in result:
+            return 400, json.dumps({"success": False, "error": result["error"]})
+        return dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------
-    # 11. Snapshot jadwal
+    # 12. Snapshot jadwal
     # POST /prs/detail/<id_detail_prs>/jadwal/snapshot
     # -----------------------------------------------------------------------
 
@@ -230,7 +243,7 @@ class GatewayService:
         return 201, dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------
-    # 12. Sync jadwal snapshot
+    # 13. Sync jadwal snapshot
     # POST /prs/jadwal/snapshot/<id_detail_prs>
     # -----------------------------------------------------------------------
 
@@ -263,7 +276,7 @@ class GatewayService:
         return dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------
-    # 13. Debug dump
+    # 14. Debug dump
     # GET /debug/dump
     # -----------------------------------------------------------------------
 

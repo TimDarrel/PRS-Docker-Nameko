@@ -18,9 +18,10 @@ Exposed RPC methods:
     8.  verify_prs                  — auto-verify a single student PRS (priority + cap + SKS)
     9.  verify_prs_by_semester      — auto-verify all PRS in a semester (shared capacity pool)
     10. push_peserta_to_transkrip   — return validated enrollments for Transkrip service
-    11. snapshot_jadwal             — snapshot jadwal into jadwal_ss
-    12. sync_jadwal_snapshot        — update jadwal_ss when Penawaran Kelas changes a jadwal
-    13. debug_dump                  — dump all rows (dev only)
+    11. invalidate_jadwal_snapshot  — mark a jadwal snapshot as outdated
+    12. snapshot_jadwal             — snapshot jadwal into jadwal_ss
+    13. sync_jadwal_snapshot        — update jadwal_ss when Penawaran Kelas changes a jadwal
+    14. debug_dump                  — dump all rows (dev only)
 """
 
 import os
@@ -591,9 +592,53 @@ class PRSService:
             }
         finally:
             db.close()
+            
+    # -----------------------------------------------------------------------
+    # 11. Invalidate jadwal snapshot
+    # -----------------------------------------------------------------------
+
+    @rpc
+    def invalidate_jadwal_snapshot(self, id_kelas):
+        """
+        Called when Penawaran Kelas alters a schedule.
+        Flags all related snapshots across all students' PRS details as outdated,
+        notifying administrators or systems that a sync is pending.
+        """
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                # Find all prs_detail IDs matching this class
+                cur.execute(
+                    "SELECT id_detail_prs FROM prs_detail WHERE id_kelas = %s",
+                    (id_kelas,)
+                )
+                details = cur.fetchall()
+                
+                if not details:
+                    return {"message": "Tidak ada snapshot yang aktif untuk kelas ini", "id_kelas": id_kelas}
+                
+                detail_ids = [d["id_detail_prs"] for d in details]
+                placeholders = ",".join(["%s"] * len(detail_ids))
+                
+                # Update the is_outdated flag to 1
+                cur.execute(
+                    f"""UPDATE jadwal_ss 
+                       SET is_outdated = 1 
+                       WHERE id_detail_prs IN ({placeholders})""",
+                    detail_ids
+                )
+                
+            db.commit()
+            logger.info(f"Class {id_kelas} schedule invalidated. Marked snapshots as outdated.")
+            return {"message": "Snapshot berhasil ditandai outdated", "id_kelas": id_kelas, "affected_records": len(detail_ids)}
+        except Exception as e:
+            db.rollback()
+            return {"error": str(e)}
+        finally:
+            db.close()
 
     # -----------------------------------------------------------------------
-    # 11. Snapshot jadwal (internal helper + public RPC wrapper)
+    # 12. Snapshot jadwal (internal helper + public RPC wrapper)
     # -----------------------------------------------------------------------
 
     def _snapshot_jadwal(self, db, id_detail_prs, jadwal_list):
@@ -631,7 +676,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 12. Sync jadwal snapshot
+    # 13. Sync jadwal snapshot
     # -----------------------------------------------------------------------
 
     @rpc
@@ -685,7 +730,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 13. Debug dump
+    # 14. Debug dump
     # -----------------------------------------------------------------------
 
     @rpc
