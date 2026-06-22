@@ -49,10 +49,7 @@ class PRSService:
     """PRS microservice. All RPC methods return plain dicts / lists."""
 
     name = "prs_service"
-
-    # NOTE: Unused for real calls until Penawaran Kelas exposes its RPC.
-    # Swap dummy jadwal block in create_prs_detail once available.
-    penawaran_kelas_rpc = RpcProxy("penawaran_kelas_service")
+    penawaran_kelas_rpc = RpcProxy("penawaran_kelas")
 
     # -----------------------------------------------------------------------
     # DB helper
@@ -131,21 +128,47 @@ class PRSService:
                 )
                 id_detail = cur.lastrowid
 
-                # ------------------------------------------------------------
-                # DUMMY DATA — replace with real RPC once Penawaran Kelas
-                # exposes get_jadwal_by_kelas(id_kelas).
-                # ------------------------------------------------------------
-                jadwal_list = [
-                    {
-                        "id_jadwal": id_kelas * 1000 + 1,
-                        "hari": "Senin",
-                        "jam_mulai": "08:00:00",
-                        "jam_selesai": "09:40:00",
-                        "ruangan": "DUMMY-ROOM",
-                        "tipe": "teori",
-                    }
-                ]
+                
+                # --- GET kuota from Kelas ---
+                kelas_info = self.penawaran_kelas_rpc.get_kelas(kelas_id=id_kelas)
+                kuota = kelas_info.get("kuota", DEFAULT_KAPASITAS)
+
+                # --- GET jadwal list ---
+                jadwal_raw = self.penawaran_kelas_rpc.get_jadwal(kelas_id=id_kelas)
+
+                jadwal_list = []
+                for j in jadwal_raw:
+                    if j["is_outdated"]:
+                        continue
+
+                    # ruang_id is nullable in their schema
+                    if j["ruang_id"]:
+                        ruang_info = self.penawaran_kelas_rpc.get_ruangan(ruang_id=j["ruang_id"])
+                        # nama_ruang is also nullable, fall back to kode_ruang
+                        ruangan = ruang_info.get("nama_ruang") or ruang_info.get("kode_ruang", str(j["ruang_id"]))
+                    else:
+                        ruangan = "TBD"  # room not yet assigned
+
+                    jadwal_list.append({
+                        "id_jadwal": j["jadwal_id"],
+                        "hari": j["hari"],
+                        "jam_mulai": j["jam_mulai"],
+                        "jam_selesai": j["jam_selesai"],
+                        "ruangan": ruangan,
+                        "tipe": j["tipe"],   
+                    })
+
+                # --- Save kuota into kelas_config (once, after loop) ---
+                cur.execute(
+                    """INSERT INTO kelas_config (id_kelas, kapasitas)
+                    VALUES (%s, %s)
+                    ON DUPLICATE KEY UPDATE kapasitas = VALUES(kapasitas)""",
+                    (id_kelas, kuota),
+                )
+
+                # --- Snapshot all jadwal rows (once, after loop) ---
                 self._snapshot_jadwal(db, id_detail, jadwal_list)
+
             db.commit()
             return {"message": "Kelas berhasil ditambahkan ke PRS", "id_detail_prs": id_detail}
         except pymysql.IntegrityError:
