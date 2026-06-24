@@ -10,18 +10,19 @@ Tables owned:
 Exposed RPC methods:
     1.  create_prs                  — insert PRS header (status=draft)
     2.  create_prs_detail           — insert one kelas into a PRS
-    3.  get_prs                     — fetch PRS header by id_mahasiswa + id_semester
-    4.  get_prs_detail_by_semester  — all details for a given semester
-    5.  get_prs_detail_by_prs_id    — all details for a given id_prs
-    6.  get_prs_detail_by_kelas_id  — all details for a given id_kelas (across all PRS)
-    7.  get_jumlah_mahasiswa_per_kelas — count students enrolled per kelas
-    8.  verify_prs                  — auto-verify a single student PRS (priority + cap + SKS)
-    9.  verify_prs_by_semester      — auto-verify all PRS in a semester (shared capacity pool)
-    10. push_peserta_to_transkrip   — return validated enrollments for Transkrip service
-    11. invalidate_jadwal_snapshot  — mark a jadwal snapshot as outdated
-    12. snapshot_jadwal             — snapshot jadwal into jadwal_ss
-    13. sync_jadwal_snapshot        — update jadwal_ss when Penawaran Kelas changes a jadwal
-    14. debug_dump                  — dump all rows (dev only)
+    3.  get_prs_by_id               — fetch PRS header by id_prs
+    4.  get_prs                     — fetch PRS header by id_mahasiswa + id_semester
+    5.  get_prs_detail_by_semester  — all details for a given semester
+    6.  get_prs_detail_by_prs_id    — all details for a given id_prs
+    7.  get_prs_detail_by_kelas_id  — all details for a given id_kelas (across all PRS)
+    8.  get_jumlah_mahasiswa_per_kelas — count students enrolled per kelas
+    9.  verify_prs                  — auto-verify a single student PRS (priority + cap + SKS)
+    10. verify_prs_by_semester      — auto-verify all PRS in a semester (shared capacity pool)
+    11. push_peserta_to_transkrip   — return validated enrollments for Transkrip service
+    12. invalidate_jadwal_snapshot  — mark a jadwal snapshot as outdated
+    13. snapshot_jadwal             — snapshot jadwal into jadwal_ss
+    14. sync_jadwal_snapshot        — update jadwal_ss when Penawaran Kelas changes a jadwal
+    15. debug_dump                  — dump all rows (dev only)
 """
 
 import os
@@ -50,6 +51,7 @@ class PRSService:
 
     name = "prs_service"
     penawaran_kelas_rpc = RpcProxy("penawaran_kelas")
+    transkrip_rpc = RpcProxy("transkrip_service")
 
     # -----------------------------------------------------------------------
     # DB helper
@@ -179,9 +181,30 @@ class PRSService:
             return {"error": str(e)}
         finally:
             db.close()
+            
+    # -----------------------------------------------------------------------
+    # 3. Fetch PRS by id
+    # -----------------------------------------------------------------------
+            
+    @rpc
+    def get_prs_by_id(self, id_prs):
+        """Called by Transkrip service to get PRS header data."""
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                cur.execute("SELECT * FROM prs WHERE id_prs = %s", (id_prs,))
+                row = cur.fetchone()
+                if not row:
+                    return {"error": f"PRS {id_prs} tidak ditemukan"}
+                result = self._serialize_row(row)
+                # Transkrip expects: id_mahasiswa, semester, tahun_ajaran
+                # Map id_semester to semester string if needed
+                return result
+        finally:
+            db.close()
 
     # -----------------------------------------------------------------------
-    # 3. Fetch PRS
+    # 4. Fetch PRS by mahasiswa + semester
     # -----------------------------------------------------------------------
 
     @rpc
@@ -201,7 +224,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 4. Fetch PRS Detail by semester
+    # 5. Fetch PRS Detail by semester
     # -----------------------------------------------------------------------
 
     @rpc
@@ -222,7 +245,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 5. Fetch PRS Detail by prs_id
+    # 6. Fetch PRS Detail by prs_id
     # -----------------------------------------------------------------------
 
     @rpc
@@ -244,7 +267,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 6. Fetch PRS Detail by kelas
+    # 7. Fetch PRS Detail by kelas
     # -----------------------------------------------------------------------
 
     @rpc
@@ -265,7 +288,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 7. Jumlah mahasiswa per kelas
+    # 8. Jumlah mahasiswa per kelas
     # -----------------------------------------------------------------------
 
     @rpc
@@ -296,7 +319,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 8. Verify PRS — single student, auto-logic
+    # 9. Verify PRS — single student, auto-logic
     # -----------------------------------------------------------------------
 
     @rpc
@@ -422,7 +445,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 9. Verify PRS by semester — all students, shared capacity pool
+    # 10. Verify PRS by semester — all students, shared capacity pool
     # -----------------------------------------------------------------------
 
     @rpc
@@ -575,49 +598,59 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 10. Push peserta to transkrip
+    # 11. Push peserta to transkrip
     # -----------------------------------------------------------------------
 
     @rpc
     def push_peserta_to_transkrip(self, id_semester):
-        """
-        Collect all validated PRS details for a semester and return them
-        ready to be pushed to the Transkrip service.
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
+                # Get all validated PRS ids for this semester
                 cur.execute(
-                    """SELECT
-                           p.id_mahasiswa,
-                           p.id_semester,
-                           pd.id_kelas,
-                           pd.id_mata_kuliah,
-                           pd.sks,
-                           pd.status_validasi
-                       FROM prs_detail pd
-                       JOIN prs p ON pd.id_prs = p.id_prs
-                       WHERE p.id_semester = %s
-                         AND p.status = 'validated'
-                         AND pd.status_validasi = 'approved'
-                       ORDER BY p.id_mahasiswa, pd.id_mata_kuliah""",
+                    """SELECT id_prs, id_mahasiswa FROM prs
+                    WHERE id_semester = %s AND status = 'validated'
+                    ORDER BY id_mahasiswa""",
                     (id_semester,),
                 )
-                peserta = cur.fetchall()
+                validated_prs = cur.fetchall()
 
-            if not peserta:
-                return {"error": "Tidak ada peserta validated untuk semester ini"}
+            if not validated_prs:
+                return {"error": "Tidak ada PRS validated untuk semester ini"}
+
+            results = []
+            for prs in validated_prs:
+                try:
+                    result = self.transkrip_rpc.push_prs_ke_krs(id_prs=prs["id_prs"])
+                    results.append({
+                        "id_prs": prs["id_prs"],
+                        "id_mahasiswa": prs["id_mahasiswa"],
+                        "status": result.get("status"),
+                        "id_krs": result.get("id_krs"),
+                        "message": result.get("message"),
+                    })
+                except Exception as e:
+                    results.append({
+                        "id_prs": prs["id_prs"],
+                        "id_mahasiswa": prs["id_mahasiswa"],
+                        "status": "error",
+                        "message": str(e),
+                    })
+
+            sukses = [r for r in results if r["status"] == "ok"]
+            gagal = [r for r in results if r["status"] != "ok"]
 
             return {
-                "message": f"{len(peserta)} peserta siap dipush ke transkrip",
+                "message": f"{len(sukses)} KRS berhasil dibuat, {len(gagal)} gagal",
                 "id_semester": id_semester,
-                "peserta": peserta,
+                "sukses": sukses,
+                "gagal": gagal,
             }
         finally:
             db.close()
             
     # -----------------------------------------------------------------------
-    # 11. Invalidate jadwal snapshot
+    # 12. Invalidate jadwal snapshot
     # -----------------------------------------------------------------------
 
     @rpc
@@ -661,7 +694,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 12. Snapshot jadwal (internal helper + public RPC wrapper)
+    # 13. Snapshot jadwal (internal helper + public RPC wrapper)
     # -----------------------------------------------------------------------
 
     def _snapshot_jadwal(self, db, id_detail_prs, jadwal_list):
@@ -699,7 +732,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 13. Sync jadwal snapshot
+    # 14. Sync jadwal snapshot
     # -----------------------------------------------------------------------
 
     @rpc
@@ -753,7 +786,7 @@ class PRSService:
             db.close()
 
     # -----------------------------------------------------------------------
-    # 14. Debug dump
+    # 15. Debug dump
     # -----------------------------------------------------------------------
 
     @rpc
