@@ -111,7 +111,7 @@ class GatewayService:
     # -----------------------------------------------------------------------
 
     @http("GET", "/prs/detail/<int:id_semester>")
-    def get_prs_detail_by_semester(self, id_semester):
+    def get_prs_detail_by_semester(self, request, id_semester):
         result = self.prs_rpc.get_prs_detail_by_semester(id_semester)
         return dumps({"success": True, "data": result})
 
@@ -273,6 +273,18 @@ class GatewayService:
         )
         if "error" in result:
             return 400, json.dumps({"success": False, "error": result["error"]})
+        return dumps({"success": True, "data": result})
+    
+    # GET /prs/detail/<id_detail_prs>/jadwal
+    @http("GET", "/prs/detail/<int:id_detail_prs>/jadwal")
+    def get_jadwal_by_detail(self, request, id_detail_prs):
+        result = self.prs_rpc.get_jadwal_by_detail(id_detail_prs=id_detail_prs)
+        return dumps({"success": True, "data": result})
+
+    # GET /prs/<id_prs>/jadwal  ← full schedule for one student's PRS
+    @http("GET", "/prs/<int:id_prs>/jadwal")
+    def get_jadwal_by_prs(self, request, id_prs):
+        result = self.prs_rpc.get_jadwal_by_prs(id_prs=id_prs)
         return dumps({"success": True, "data": result})
 
     # -----------------------------------------------------------------------

@@ -22,7 +22,9 @@ Exposed RPC methods:
     12. invalidate_jadwal_snapshot  — mark a jadwal snapshot as outdated
     13. snapshot_jadwal             — snapshot jadwal into jadwal_ss
     14. sync_jadwal_snapshot        — update jadwal_ss when Penawaran Kelas changes a jadwal
-    15. debug_dump                  — dump all rows (dev only)
+    15. get_jadwal_by_detail        — fetch jadwal_ss for a single PRS detail
+    16. get_jadwal_by_prs           — fetch jadwal_ss for all
+    17. debug_dump                  — dump all rows (dev only)
 """
 
 import os
@@ -784,9 +786,54 @@ class PRSService:
             return {"error": str(e)}
         finally:
             db.close()
+            
+    # -----------------------------------------------------------------------
+    # 15. Get jadwal snapshot by detail or by PRS
+    # -----------------------------------------------------------------------
+            
+    @rpc
+    def get_jadwal_by_detail(self, id_detail_prs):
+        """Get jadwal snapshot for a specific prs_detail row."""
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM jadwal_ss
+                    WHERE id_detail_prs = %s
+                    ORDER BY hari, jam_mulai""",
+                    (id_detail_prs,),
+                )
+                rows = cur.fetchall()
+                return [self._serialize_row(r) for r in rows]
+        finally:
+            db.close()
 
     # -----------------------------------------------------------------------
-    # 15. Debug dump
+    # 16. Get jadwal snapshot by PRS (full student schedule)
+    # -----------------------------------------------------------------------
+    
+    @rpc
+    def get_jadwal_by_prs(self, id_prs):
+        """Get all jadwal snapshots for all kelas in a PRS (full student schedule)."""
+        db = self._db()
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    """SELECT js.*, pd.id_kelas, pd.id_mata_kuliah, pd.prioritas,
+                            pd.status_validasi, pd.sks
+                    FROM jadwal_ss js
+                    JOIN prs_detail pd ON js.id_detail_prs = pd.id_detail_prs
+                    WHERE pd.id_prs = %s
+                    ORDER BY js.hari, js.jam_mulai""",
+                    (id_prs,),
+                )
+                rows = cur.fetchall()
+                return [self._serialize_row(r) for r in rows]
+        finally:
+            db.close()
+
+    # -----------------------------------------------------------------------
+    # 17. Debug dump
     # -----------------------------------------------------------------------
 
     @rpc
