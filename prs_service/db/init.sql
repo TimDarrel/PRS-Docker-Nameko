@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS jadwal_ss (
     jam_selesai     TIME         NOT NULL,
     hari            VARCHAR(20)  NOT NULL,
     ruangan         VARCHAR(50)  NOT NULL,
-    tipe            ENUM('teori', 'praktikum') NOT NULL,
+    tipe            VARCHAR(20)  NOT NULL,
     is_outdated     TINYINT(1)   NOT NULL DEFAULT 0,
     snapshotted_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (id_detail_prs) REFERENCES prs_detail(id_detail_prs) ON DELETE CASCADE
