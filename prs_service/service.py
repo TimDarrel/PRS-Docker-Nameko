@@ -54,6 +54,7 @@ class PRSService:
     name = "prs_service"
     penawaran_kelas_rpc = RpcProxy("penawaran_kelas")
     transkrip_rpc = RpcProxy("transkrip_service")
+    perwalian = RpcProxy("perwalian_service")
 
     # -----------------------------------------------------------------------
     # DB helper
@@ -82,6 +83,19 @@ class PRSService:
         """
         db = self._db()
         try:
+            perwalian_resp = self.perwalian.get_perwalian_by_student(
+                student_id=id_mahasiswa, semester_id=id_semester
+            )
+
+            if isinstance(perwalian_resp, dict) and perwalian_resp.get("status") == "error":
+                return {"error": perwalian_resp.get("message")}
+
+            if not perwalian_resp:
+                return {"error": "Data perwalian tidak ditemukan untuk semester ini"}
+
+            if not perwalian_resp[0].get("is_prs_allowed"):
+                return {"error": "Mahasiswa belum divalidasi oleh dosen wali untuk semester ini"}
+            
             with db.cursor() as cur:
                 cur.execute(
                     """INSERT INTO prs (id_mahasiswa, id_semester, dosen_wali_id, status, total_sks)
@@ -103,11 +117,6 @@ class PRSService:
 
     @rpc
     def create_prs_detail(self, id_prs, id_kelas, id_mata_kuliah, sks, prioritas=1):
-        """
-        Add a kelas to an existing PRS.
-        Only allowed when PRS status is 'draft'.
-        prioritas: 1 (utama), 2 (cadangan 1), 3 (cadangan 2).
-        """
         db = self._db()
         try:
             with db.cursor() as cur:
@@ -126,43 +135,50 @@ class PRSService:
 
                 cur.execute(
                     """INSERT INTO prs_detail
-                           (id_prs, id_kelas, id_mata_kuliah, prioritas, sks, status_validasi)
-                       VALUES (%s, %s, %s, %s, %s, 'pending')""",
+                        (id_prs, id_kelas, id_mata_kuliah, prioritas, sks, status_validasi)
+                    VALUES (%s, %s, %s, %s, %s, 'pending')""",
                     (id_prs, id_kelas, id_mata_kuliah, prioritas, sks),
                 )
                 id_detail = cur.lastrowid
 
-                
                 # --- GET kuota from Kelas ---
-                kelas_info = self.penawaran_kelas_rpc.get_kelas(kelas_id=id_kelas)
+                kelas_info = self.penawaran_kelas.get_kelas(kelas_id=id_kelas)
+                if "error" in kelas_info:
+                    db.rollback()
+                    return {"error": kelas_info["error"]}
                 kuota = kelas_info.get("kuota", DEFAULT_KAPASITAS)
 
-                # --- GET jadwal list ---
-                jadwal_raw = self.penawaran_kelas_rpc.get_jadwal(kelas_id=id_kelas)
+                # --- GET jadwal kuliah only ---
+                cur.execute(
+                    "SELECT id_jadwal FROM prs_detail_jadwal WHERE id_detail_prs = %s",
+                    (id_detail,),
+                )
+                existing_jadwal_ids = {r["id_jadwal"] for r in cur.fetchall()}
 
+                jadwal_raw = self.penawaran_kelas.get_jadwal(kelas_id=id_kelas)
                 jadwal_list = []
                 for j in jadwal_raw:
-                    if j["is_outdated"]:
+                    if j["tipe"] != "kuliah" or j["is_outdated"]:
+                        continue
+                    if j["jadwal_id"] in existing_jadwal_ids:
                         continue
 
-                    # ruang_id is nullable in their schema
-                    if j["ruang_id"]:
-                        ruang_info = self.penawaran_kelas_rpc.get_ruangan(ruang_id=j["ruang_id"])
-                        # nama_ruang is also nullable, fall back to kode_ruang
-                        ruangan = ruang_info.get("nama_ruang") or ruang_info.get("kode_ruang", str(j["ruang_id"]))
-                    else:
-                        ruangan = "TBD"  # room not yet assigned
+                    ruangan = "TBD"
+                    if j.get("ruang_id"):
+                        ruang_info = self.penawaran_kelas.get_ruang(ruang_id=j["ruang_id"])
+                        if "error" not in ruang_info:
+                            ruangan = ruang_info.get("nama_ruang") or ruang_info.get("kode_ruang", "TBD")
 
                     jadwal_list.append({
-                        "id_jadwal": j["jadwal_id"],
-                        "hari": j["hari"],
-                        "jam_mulai": j["jam_mulai"],
+                        "id_jadwal":   j["jadwal_id"],
+                        "hari":        j["hari"],
+                        "jam_mulai":   j["jam_mulai"],
                         "jam_selesai": j["jam_selesai"],
-                        "ruangan": ruangan,
-                        "tipe": j["tipe"],   
+                        "ruangan":     ruangan,
+                        "tipe":        j["tipe"],
                     })
 
-                # --- Save kuota into kelas_config (once, after loop) ---
+                # --- Save kuota ---
                 cur.execute(
                     """INSERT INTO kelas_config (id_kelas, kapasitas)
                     VALUES (%s, %s)
@@ -170,7 +186,7 @@ class PRSService:
                     (id_kelas, kuota),
                 )
 
-                # --- Snapshot all jadwal rows (once, after loop) ---
+                # --- Snapshot jadwal ---
                 self._snapshot_jadwal(db, id_detail, jadwal_list)
 
             db.commit()
@@ -608,46 +624,23 @@ class PRSService:
         db = self._db()
         try:
             with db.cursor() as cur:
-                # Get all validated PRS ids for this semester
                 cur.execute(
-                    """SELECT id_prs, id_mahasiswa FROM prs
-                    WHERE id_semester = %s AND status = 'validated'
-                    ORDER BY id_mahasiswa""",
+                    """SELECT pd.id_mata_kuliah, pd.id_kelas, p.id_mahasiswa
+                    FROM prs_detail pd
+                    JOIN prs p ON pd.id_prs = p.id_prs
+                    WHERE p.id_semester = %s
+                        AND p.status = 'validated'
+                        AND pd.status_validasi = 'approved'
+                    ORDER BY p.id_mahasiswa""",
                     (id_semester,),
                 )
-                validated_prs = cur.fetchall()
+                peserta = cur.fetchall()
 
-            if not validated_prs:
+            if not peserta:
                 return {"error": "Tidak ada PRS validated untuk semester ini"}
 
-            results = []
-            for prs in validated_prs:
-                try:
-                    result = self.transkrip_rpc.push_prs_ke_krs(id_prs=prs["id_prs"])
-                    results.append({
-                        "id_prs": prs["id_prs"],
-                        "id_mahasiswa": prs["id_mahasiswa"],
-                        "status": result.get("status"),
-                        "id_krs": result.get("id_krs"),
-                        "message": result.get("message"),
-                    })
-                except Exception as e:
-                    results.append({
-                        "id_prs": prs["id_prs"],
-                        "id_mahasiswa": prs["id_mahasiswa"],
-                        "status": "error",
-                        "message": str(e),
-                    })
+            return {"peserta": [dict(row) for row in peserta]}
 
-            sukses = [r for r in results if r["status"] == "ok"]
-            gagal = [r for r in results if r["status"] != "ok"]
-
-            return {
-                "message": f"{len(sukses)} KRS berhasil dibuat, {len(gagal)} gagal",
-                "id_semester": id_semester,
-                "sukses": sukses,
-                "gagal": gagal,
-            }
         finally:
             db.close()
             

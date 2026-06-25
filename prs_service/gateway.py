@@ -12,11 +12,13 @@ Routes:
   GET    /prs/kelas/<id_kelas>/jumlah                → get_jumlah_mahasiswa_per_kelas
   GET    /prs/kelas/jumlah                           → get_jumlah_mahasiswa_per_kelas (all)
   PUT    /prs/<id_prs>/verify                        → verify_prs          (single student, auto)
-  PUT   /prs/semester/<id_semester>/verify           → verify_prs_by_semester (whole semester)
+  PUT    /prs/semester/<id_semester>/verify           → verify_prs_by_semester (whole semester)
   POST   /prs/transkrip/<id_semester>                → push_peserta_to_transkrip
   PUT    /prs/jadwal/invalidate/<id_kelas>           → invalidate_jadwal
   POST   /prs/detail/<id_detail_prs>/jadwal/snapshot → snapshot_jadwal
   POST   /prs/jadwal/snapshot/<id_detail_prs>        → sync_jadwal_snapshot
+  GET    /prs/detail/<id_detail_prs>/jadwal          → get_jadwal_by_detail
+  GET    /prs/<id_prs>/jadwal                        → get_jadwal_by_prs
   GET    /debug/dump                                 → debug_dump
 """
 

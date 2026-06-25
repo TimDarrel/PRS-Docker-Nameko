@@ -1,17 +1,17 @@
 #version: "2"
 services:
-  rabbitmq:
-    container_name: prs-rabbitmq
-    image: rabbitmq:management
-    ports:
-        - "5672:5672"
-        - "15672:15672"
-    restart: always
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # rabbitmq:
+  #   container_name: prs-rabbitmq
+  #   image: rabbitmq:management
+  #   ports:
+  #       - "5672:5672"
+  #       - "15672:15672"
+  #   restart: always
+  #   healthcheck:
+  #     test: ["CMD", "rabbitmq-diagnostics", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
 
   mysql:
     container_name: prs-mysql
@@ -32,6 +32,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - shared-broker
 
   service:
     build:
@@ -39,8 +41,8 @@ services:
       dockerfile: Dockerfile
     container_name: prs_service
     depends_on:
-      rabbitmq:
-        condition: service_healthy
+      # rabbitmq:
+      #   condition: service_healthy
       mysql:
         condition: service_healthy
     environment:
@@ -54,6 +56,8 @@ services:
       DB_NAME: prs_db
       DB_USER: prs_user
       DB_PASSWORD: prs_password
+    networks:
+      - shared-broker
     volumes:
       - ./prs_service:/app
     command: nameko run --config config.yml service
@@ -65,21 +69,22 @@ services:
     container_name: prs_gateway
     ports:
       - "5000:5000"
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
+    # depends_on:
+    #   # rabbitmq:
+    #   #   condition: service_healthy
     environment:
       RABBIT_PASSWORD: guest
       RABBIT_USER: guest
       RABBIT_HOST: rabbitmq
       RABBIT_PORT: 5672
+    networks:
+      - shared-broker
     volumes:
       - ./prs_service:/app
     command: nameko run --config config.yml gateway
 
 networks:
-  default:
-    name:  prs
+  shared-broker:
     external: true
 
 volumes:
